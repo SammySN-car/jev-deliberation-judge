@@ -1,0 +1,42 @@
+﻿[project]
+name = "deliberation-judge"
+version = "0.1.0"
+description = "Blind multi-juror deliberation over local calibrated decision models (Laya) with abstention and held-out evaluation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "laya",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+jev = [
+    "typesafe-sdk",
+]
+
+[project.scripts]
+judge = "deliberation_judge.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deliberation_judge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: hits local Laya model (deselect with -m 'not live')",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
