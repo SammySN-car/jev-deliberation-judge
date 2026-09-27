@@ -111,7 +111,7 @@ Elements specific to this project (jury pattern applied to System One / Laya, us
 5. Ablation with **competence gate + matched-coverage baseline + three-valued verdict + power/MDE** on a non-generative backend — rigor pattern has precedent (Judge Knows When It Knows); applied here, not claimed as invented
 6. Laya-specific **co-batching attention probe** (appendix; batching not a headline — sequential fine at ~33ms)
 
-External motivation only: quorum-cal; Nine Judges Two Effective Votes (effective-vote bound); Judge Knows When It Knows (ICC ~1.9-2.6 of 16, INCONCLUSIVE tier). Full stack: no exact public match; ingredients and H0-like findings do — do not oversell.
+External motivation only: quorum-cal; Nine Judges Two Effective Votes (effective-vote bound); Judge Knows When It Knows (ICC ~1.9-2.6 of 16, INCONCLUSIVE tier). Domain-side sweep for D1 (moderation/escalation - Section 13 domain table): AEGIS, JurEE, MV-Debate, Act-or-Defer, Conformal Social Choice, LPP. Full stack: no exact public match; ingredients and H0-like findings do — do not oversell.
 
 ---
 
@@ -158,6 +158,8 @@ pip install laya
 # If transformers hangs on import (TF probe deadlock): export USE_TF=0
 ```
 
+**Dependency floor (README 0.3.20):** Python **3.10+**; `huggingface_hub` 1.x, `transformers` 5.x and `torch` 2.14 all require it. Installing `laya` can **upgrade an existing torch** (this machine: `torch 2.10.0+cpu`) - to keep a pinned CPU wheel, install torch first (`pip install torch --index-url https://download.pytorch.org/whl/cpu`), then `pip install laya`. Extras: `laya[serve]` (HTTP server), `laya[structured]` (pydantic `decide(schema=...)`), `laya[mcp]`, `laya[onnx]`, `laya[fast]` (TileLang GPU path: drift up to 0.05 vs fp32 - keep it off for anything calibrated).
+
 **Single-model mode** (one fixed checkpoint per call):
 
 ```python
@@ -176,6 +178,8 @@ router = Router(preload=True)   # all checkpoints in RAM; sub-35ms routing
 res = router.predict(state, questions)
 res["routing"]["model"]  # 'english' | 'multilingual' | 'typed-decisions'
 ```
+
+**HTTP mode (optional):** `pip install "laya[serve]"` then `laya-serve` speaks the **identical wire protocol Jev clients use** (`POST /v1/systemone`) - porting a Jev client is a `baseUrl` change. Lets the judge process call a separate inference service instead of importing torch.
 
 ### Question dict schema (verified from model card)
 
@@ -221,6 +225,11 @@ answers["churn_risk"]["noul"]     # -> 0.892      (P(yes))
 - **Budget:** English root = **512 tokens total** (`head_max_len=192` for options -> **~320 tokens left for state**). Multilingual/typed-decisions = 1024 (`head_max_len=256` -> ~768 state).
 - **Cardinality limit:** high-option Choice (>20 labels) degrades sharply at default head budget (Banking77: Jev 0.870 vs Laya 0.425). Label sets should stay <= 8-10.
 
+- **Calibrated gate field:** each answer carries **`answer_confidence`** = probability of the reported answer - the one field that behaves the same across all three primitives. The `confidence` field on choice/score is `1 - normalized entropy` (concentration of the distribution, not correctness), a *different formula* from Jev's `(n*p_max - 1)/(n - 1)` - **do not carry Jev thresholds over**.
+- **State batching (spike / inference set):** `agent.predict_batch(states, questions, batch_size=...)` scores a list of states against the same questions in shared forward passes; results align to input order. This is the M7 path for n>=200 rows. On CPU, larger batches may not speed things up; leave `sort_by_length` **off** for calibration runs (batch-shape changes cause FP differences near decision thresholds).
+- **Long states:** `predict` **silently truncates** to one `max_len` window; `predict_long(state, questions)` scans overlapping windows and aggregates (noul = strongest window, choice/score = most-confident window), but the returned probability is the deciding window's - **not a calibrated whole-document number** (check `answer["window"]`). Jigsaw comments can exceed the ~320-token budget: prune in `state_builder` or use `predict_long` deliberately.
+- **CLI + presets (fast spike, no code):** `laya "comment text" --predict --preset moderation` - built-in presets: `triage`, `email`, `guard`, `moderation`, `router`. SDK equivalents: `laya.moderation_questions()` (toxicity, harassment, threats), `laya.guard_questions()`, `laya.triage_questions()`, `laya.router_questions()` - a pre-tuned moderation framing exists; use it as the spike baseline against our hand-written toxic/clean Choice.
+
 ### Laya vs Jev — benchmarks (from model card; Jev figures third-party published)
 
 | Metric | TypeSafe Jev 1.13.0 | Laya (routed) | Note |
@@ -260,6 +269,15 @@ Raw Laya outputs are over-confident (raw mean ECE ~0.466 on their benches). Meth
 
 Fit per bucket; do not share T across question types with different option counts.
 
+**Metric definitions (used by M7 / README):**
+
+- **ECE** (10 equal-width bins): `ECE = sum_b (|B_b|/n) * |acc(B_b) - conf(B_b)|` - bin-weighted gap between empirical accuracy and mean confidence.
+- **Brier:** `mean (p - y)^2` - squared error of probabilities (lower is better).
+- **NLL / log loss:** `-mean [y*log p + (1-y)*log(1-p)]` - the objective temperature scaling minimizes.
+- All three are **group-level** statistics (Section 2); none guarantees any single answer.
+
+**Serve dtype affects thresholds:** CUDA >= sm80 defaults to bf16 - bf16 moves probabilities by up to **0.073** vs fp32 (flips 3/864 argmaxes); fp16 stays within 0.019 with zero flips. Fit and serve in the same dtype (`LAYA_CUDA_AMP=fp16|bf16`; CPU counterpart `LAYA_CPU_AMP`). Default CPU path = fp32 (reference dtype); keep `fast=True` off for calibration.
+
 ### Design implications for us (updated with verified API)
 
 | Implication | Action |
@@ -271,8 +289,11 @@ Fit per bucket; do not share T across question types with different option count
 | Zero-shot weak outside fine-tuned domains | D1 domain should match base Laya competence, or include a fine-tune step (notebook on GitHub) |
 | One forward pass answers all questions in a call | Within-juror fan-out adds no forward passes; panel of N jurors = N forward passes |
 | TF import deadlock | Set `USE_TF=0` when `laya.load` hangs |
+| n>=200 inference set | `agent.predict_batch(states, questions)` - one state per row, shared forward passes (Section 2b) |
+| Built-in `moderation_questions()` preset | Free baseline juror framing for the D1 spike; compare vs hand-written toxic/clean Choice |
+| Jev confidence thresholds | Formula differs on Laya - gate on `answer_confidence`, refit threshold (Sections 2b/3) |
 
-**Verify on your machine before M2 (remaining):** actual CPU latency with `Router(preload=True)` vs `laya.load`, RAM footprint, and whether `USE_TF=0` is needed in your env.
+**Verify on your machine before M2 (remaining):** actual CPU latency with `Router(preload=True)` vs `laya.load`, RAM footprint, `predict_batch` speedup on CPU (spike dataset), and whether `USE_TF=0` is needed in your env.
 
 ---
 ## 3. Theory — The Three Primitives (deep dive)
@@ -335,6 +356,9 @@ question = Score(
 - Distinct from probability. Probability = distribution over outcomes. **Confidence** = how decisive/settled the model is about that distribution (TypeSafe's extra signal).
 - Noul has **no** confidence field — only the probability.
 - Official guidance: use confidence for **routing** (auto-act vs escalate), not as a substitute for probability.
+
+- **Laya's actual formula (GitHub README):** `confidence` (choice/score) = **1 - normalized entropy**. Jev's `(n*p_max - 1)/(n - 1)` is different - Jev thresholds do not transfer. For one number that works on every primitive, gate on **`answer_confidence`** (probability of the reported answer).
+- A threshold is a **policy you choose** from measured accuracy at coverage on your data, not a property of the model. Shipped checkpoints are over-confident; `laya-multilingual` ships with **no fitted temperatures at all** - fit before gating.
 
 ### Cross-primitive disagreement (detected signal)
 
@@ -993,6 +1017,7 @@ Exit codes: `0` auto_act, `2` human_review, `3` escalate, `1` error — enables 
 | `panel` wiring | jurors receive identical state, disjoint keys | mock backend | fake `DecisionBackend` returns canned answers |
 | `calibration` | temperature fit reduces ECE on synthetic | no | small labeled fixture set |
 | `live` | one real Laya forward pass smoke test | yes | `@pytest.mark.live`; excluded from default CI |
+| `laya-evals` (official harness, optional) | `laya-evals run data.jsonl --min-accuracy 0.8 --max-ece 0.05 --slice language` - exits non-zero on threshold/baseline failure | yes | pure-python metrics (choice_accuracy, noul_accuracy, score_mae, ece, mean_confidence, latency); precedent for M7 gates |
 
 Property-style tests on aggregators: permutation invariance (juror order does not change winner), weight monotonicity (raising winner weight never flips result away from winner).
 
@@ -1030,6 +1055,10 @@ Property-style tests on aggregators: permutation invariance (juror order does no
 | 12 | Assuming Laya zero-shot is strong everywhere | Near-chance outside competent domains | D1 domain selection or fine-tune (Honest Limits) |
 | 13 | Enabling batched questions before leakage test | Jurors no longer blind (unverified for Laya) | Sequential default; batched only after batched-vs-seq divergence test |
 | 14 | Shipping status thresholds without simulation | Escalation rate pathologically high (or auto-act accuracy poor) | Simulate table on fixtures; record escalation rate before locking defaults |
+| 15 | Carrying Jev confidence thresholds to Laya | Gate silently mis-calibrated | Formulas differ (Jev `(n*p_max-1)/(n-1)` vs Laya `1 - normalized entropy`); gate on `answer_confidence`, refit (Sections 2b/3) |
+| 16 | Boolean-word choice keys (`true`/`false`, `yes`/`no`) | Model follows the key text instead of the criteria | Semantic or opaque `A`/`B` keys; semantic keys alone do **not** make negation safe (GitHub #377: `cancel_account` won on negated inputs at p=0.9998) |
+| 17 | Long comment hits `max_len` | Silent truncation - confident answer on first window only | Prune/precompute in `state_builder`, or `predict_long` + record `answer["window"]` (Section 2b) |
+| 18 | `noul` criteria keyed anything but `true`/`false` | Keys rejected (previously silently dropped, answered against defaults - cost 2/3 reviews in #156) | Keep criteria `true`/`false`; reword model-facing text via optional `labels` mapping only |
 
 ---
 
@@ -1059,6 +1088,7 @@ Property-style tests on aggregators: permutation invariance (juror order does no
 | Laya model card (API, benchmarks, limits) | https://huggingface.co/convaiinnovations/laya |
 | Laya GitHub (BENCHMARKS.md, fine-tune notebook) | https://github.com/NandhaKishorM/laya |
 | Laya PyPI | https://pypi.org/project/laya/ |
+| Laya docs site (hooks, structured, evals, API ref) | https://nandhakishorm.github.io/laya/ |
 | Laya demo Space | https://huggingface.co/spaces/convaiinnovations/laya-demo |
 
 ### Prior-art map (non-official)
@@ -1082,6 +1112,20 @@ Property-style tests on aggregators: permutation invariance (juror order does no
 | Nine Judges, Two Effective Votes | https://arxiv.org/abs/2605.29800 | ~2.2 effective independent votes bound what weighting can extract — **H0-like result already published including calibrated soft voting** |
 | Finite-Calibration Regime Map | https://arxiv.org/html/2606.01034v1 | Post-hoc temperature scaling for judge panels; cites SCOPE (arXiv 2602.13110) conformal selective judging |
 | omp-laya-judge | https://github.com/F0Rextasy/omp-laya-judge | Only prior Laya judge found: single-call, confidence-gated; **no panel, no calibration study** |
+
+#### Domain prior art (moderation / escalation sweep - titles verified via arXiv API, 2026-09)
+
+| Work | arXiv | What it already does | Delta (ours) |
+|---|---|---|---|
+| AEGIS | https://arxiv.org/abs/2404.05993 | Ensemble of instruction-tuned LLM safety experts + no-regret online adaptation for deployment-time content moderation; 13-risk taxonomy, ~26k dataset | Heterogeneous trained experts + online learning; ours: one calibrated encoder, framing-diverse blind jurors, offline code-level aggregation |
+| JurEE | https://arxiv.org/abs/2410.08442 | **Closest:** small encoder-only transformer ensemble giving probabilistic risk estimates with per-risk thresholds (OpenAI Moderation, ToxicChat benchmarks) | Same spirit (non-generative, thresholded); ours: same-model different-framing jurors, calibrated-probability weights, cross-primitive dissent, veto, matched-coverage ablation |
+| MV-Debate | https://arxiv.org/abs/2508.05557 | 4-agent multi-view *text debate* with reflection gating for multimodal harmful-content detection | Iterative debate = token cost, no blindness; ours: single-pass blind votes, no deliberation text |
+| LLM Performance Predictors | https://arxiv.org/abs/2601.07006 | Learned meta-model (logprobs, entropy, attribution) for cost-aware escalate-vs-automate in human-AI moderation (AAMAS 2026) | Escalation-on-uncertainty precedent in our exact domain; mechanism: supervised meta-model vs our published uncertainty bands |
+| Budgeted Act-or-Defer | https://arxiv.org/abs/2606.29654 | Multi-agent deliberation act/defer via kNN lower confidence bounds on state-conditional correctness; pre-declared wrong-action budget, beta = delta + alpha + eps_act | Reliability certificates for debate prefixes; ours: Clopper-Pearson bounds on panel accuracy at simulation-locked thresholds |
+| Conformal Social Choice | https://arxiv.org/abs/2604.07667 | Linear opinion pool + split conformal -> act vs escalate; 81.9% of wrong-consensus cases intercepted at alpha=0.05 (selection effect, honestly reported) | "Agreement is not correctness" = empirical support for H0; ours: uncertainty bands on calibrated probs, not conformal coverage |
+| Persona-Aware Toxicity + SVM | https://arxiv.org/abs/2601.02337 | Learned SVM meta-ensemble over 4 prompt variants beats majority voting on subjective toxicity | Learned aggregation > naive majority in our D1 domain; ours: temperature-fitted weights on one model (no learned combiner), N small |
+
+Also observed (GitHub, details unverified): `zengzifan1/multi-agent-moderation` (multi-agent moderation pipeline), JevJudge (Spring AI decision-judge integration).
 
 ---
 
