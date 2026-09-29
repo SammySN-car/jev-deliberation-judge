@@ -18,7 +18,7 @@
 7. [Theory — Deliberation & aggregation](#7-theory--deliberation--aggregation)
 8. [Reference — TypeSafe SDK](#8-reference-code--typesafe-python-sdk-official-shapes)
 9. [Reference — Deliberation skeleton + worked example](#9-reference-code--deliberation-skeleton-design-sketch-not-final)
-10. [Design decisions open](#10-design-decisions-still-open-decide-before-build)
+10. [Design decisions (D1+D2 decided; D3-D7 open)](#10-design-decisions-d1--d2-decided-d3-d7-open---decide-before-build)
 11. [Milestones (detailed)](#11-milestones)
     - 11b. [Structure, deps, CLI, tests](#11b-project-structure-dependencies-cli--tests)
 12. [Design rationale FAQ](#12-design-rationale-frequently-asked-questions)
@@ -134,7 +134,7 @@ Three post-training paths (from the official AI primer):
 
 1. **RLHF** — trains models to say what humans prefer. Risks: sycophancy, confident hallucinations, **mode dropping** (narrows output distribution to a favored style).
 2. **RLVR** — verifiable rewards; strong at math; slow/expensive.
-3. **RLCD (Reinforcement Learning for Calibrated Decisions)** — TypeSafe's path. Optimizes for: *decisions + probabilities where higher probability ⇒ higher chance of being correct*.
+3. **RLCD (Reinforcement Learning for Calibrated Decisions)** — TypeSafe's path. Optimizes for: *decisions + probabilities where higher probability ⇒ higher chance of being correct*. Mechanism (official primer / Laya README): the reward is a **strictly proper scoring rule** (Brier / log score) on the emitted probability - truthful probabilities uniquely maximize expected reward - and a non-autoregressive head emits the full distribution in one forward pass.
 
 **Calibration:** across many predictions, answers assigned 0.8 should be correct ~80% of the time. This is a **group-level** statistical property, **not** a guarantee about any single answer. Juror weighting operates on group-level properties, not per-answer guarantees.
 
@@ -194,7 +194,7 @@ questions = {
     "department": {
         "type": "choice",                    # 'choice' | 'score' | 'noul'
         "instructions": "Which department should handle this request?",
-        "criteria": {                        # dict for choice; list for score; omitted for noul
+        "criteria": {                        # dict for choice; list for score; OMIT for noul (if ever present, keys MUST be true/false - Gotcha 18)
             "billing": "invoices, payments, refunds",
             "technical": "bugs, outages, system errors",
             "sales": "pricing, new contracts",
@@ -225,7 +225,7 @@ answers["churn_risk"]["noul"]     # -> 0.892      (P(yes))
 - **Budget:** English root = **512 tokens total** (`head_max_len=192` for options -> **~320 tokens left for state**). Multilingual/typed-decisions = 1024 (`head_max_len=256` -> ~768 state).
 - **Cardinality limit:** high-option Choice (>20 labels) degrades sharply at default head budget (Banking77: Jev 0.870 vs Laya 0.425). Label sets should stay <= 8-10.
 
-- **Calibrated gate field:** each answer carries **`answer_confidence`** = probability of the reported answer - the one field that behaves the same across all three primitives. The `confidence` field on choice/score is `1 - normalized entropy` (concentration of the distribution, not correctness), a *different formula* from Jev's `(n*p_max - 1)/(n - 1)` - **do not carry Jev thresholds over**.
+- **Calibrated gate field:** each answer carries **`answer_confidence`** = probability of the reported answer - the one field that behaves the same across all three primitives. The `confidence` field on choice/score is `1 - normalized entropy` (concentration of the distribution, not correctness), a *different formula* from Jev's `(n*p_max - 1)/(n - 1)` - **do not carry Jev thresholds over**. (`answer_confidence` itself: verify it rides on Noul answers on the first live call, M2; fallback if absent: adapter computes max(p, 1-p).)
 - **State batching (spike / inference set):** `agent.predict_batch(states, questions, batch_size=...)` scores a list of states against the same questions in shared forward passes; results align to input order. This is the M7 path for n>=200 rows. On CPU, larger batches may not speed things up; leave `sort_by_length` **off** for calibration runs (batch-shape changes cause FP differences near decision thresholds).
 - **Long states:** `predict` **silently truncates** to one `max_len` window; `predict_long(state, questions)` scans overlapping windows and aggregates (noul = strongest window, choice/score = most-confident window), but the returned probability is the deciding window's - **not a calibrated whole-document number** (check `answer["window"]`). Jigsaw comments can exceed the ~320-token budget: prune in `state_builder` or use `predict_long` deliberately.
 - **CLI + presets (fast spike, no code):** `laya "comment text" --predict --preset moderation` - built-in presets: `triage`, `email`, `guard`, `moderation`, `router`. SDK equivalents: `laya.moderation_questions()` (toxicity, harassment, threats), `laya.guard_questions()`, `laya.triage_questions()`, `laya.router_questions()` - a pre-tuned moderation framing exists; use it as the spike baseline against our hand-written toxic/clean Choice.
@@ -263,7 +263,7 @@ Raw Laya outputs are over-confident (raw mean ECE ~0.466 on their benches). Meth
        p_calibrated = softmax(logits / T)    # Choice
        p_calibrated = sigmoid(logit(p) / T)  # Noul (logit = log(p/(1-p)))
 
-   (If only probabilities are exposed, optimize T directly on p via the same NLL; equivalent to Platt-style scaling without intercept.)
+   (If only probabilities are exposed, optimize T directly on p via the same NLL; equivalent to Platt-style scaling without intercept.) Closed-form alternative in probability space (Choice, no logits needed): `p_cal_i = p_i**(1/T) / sum_j p_j**(1/T)` - algebraically identical to softmax(log p / T); binary Noul reduces to the sigmoid line above.
 3. Apply T at inference inside `JurorResult` weight derivation — aggregation reads calibrated probabilities only.
 4. Report ECE before/after (reliability diagram bins of 10) in README.
 
@@ -275,6 +275,7 @@ Fit per bucket; do not share T across question types with different option count
 - **Brier:** `mean (p - y)^2` - squared error of probabilities (lower is better).
 - **NLL / log loss:** `-mean [y*log p + (1-y)*log(1-p)]` - the objective temperature scaling minimizes.
 - All three are **group-level** statistics (Section 2); none guarantees any single answer.
+- **Sharpness (discrimination) caveat:** calibration alone is gameable - always predicting the base rate is perfectly calibrated and useless. Report calibration (ECE/Brier/NLL) **and** discrimination (accuracy / AUROC) together; never tune on ECE alone.
 
 **Serve dtype affects thresholds:** CUDA >= sm80 defaults to bf16 - bf16 moves probabilities by up to **0.073** vs fp32 (flips 3/864 argmaxes); fp16 stays within 0.019 with zero flips. Fit and serve in the same dtype (`LAYA_CUDA_AMP=fp16|bf16`; CPU counterpart `LAYA_CPU_AMP`). Default CPU path = fp32 (reference dtype); keep `fast=True` off for calibration.
 
@@ -283,7 +284,7 @@ Fit per bucket; do not share T across question types with different option count
 | Implication | Action |
 |---|---|
 | Jurors = local `agent.predict()` calls, not paid API | Tests can hit Laya live; no token budget for unit tests (use fixtures for CI) |
-| ~320 tokens of state (English root) | `state_builder` precomputes dates/counts and strips irrelevant text (M1) |
+| ~320 tokens of state (English root) | `state_builder` precomputes length stats/flags (D1: no dates) and strips irrelevant text (M1) |
 | Question schema = plain dict | `typesafe-sdk` not required for Laya path; `DecisionBackend` interface retained for optional Jev M8 |
 | Over-confident output (raw ECE 0.466) | M7: fit temperature on labeled fixtures; record ECE before/after |
 | Zero-shot weak outside fine-tuned domains | D1 domain should match base Laya competence, or include a fine-tune step (notebook on GitHub) |
@@ -354,7 +355,7 @@ question = Score(
 ### Confidence (Choice and Score only)
 
 - Distinct from probability. Probability = distribution over outcomes. **Confidence** = how decisive/settled the model is about that distribution (TypeSafe's extra signal).
-- Noul has **no** confidence field — only the probability.
+- Noul has **no** confidence field — only the probability. Gate field `answer_confidence` is still expected on Noul (Section 2b) - **confirm on the first live call (M2)**, fallback max(p, 1-p).
 - Official guidance: use confidence for **routing** (auto-act vs escalate), not as a substitute for probability.
 
 - **Laya's actual formula (GitHub README):** `confidence` (choice/score) = **1 - normalized entropy**. Jev's `(n*p_max - 1)/(n - 1)` is different - Jev thresholds do not transfer. For one number that works on every primitive, gate on **`answer_confidence`** (probability of the reported answer).
@@ -381,6 +382,15 @@ Official rules for state:
 - State is ingested **once** per request; questions evaluate against it in parallel.
 
 **Design:** one `build_state(domain_object) -> str | dict` function; every juror call receives identical state. Juror diversity is confined to `questions`.
+
+**D1 contract (Jigsaw Toxic - locked):**
+
+| Piece | Rule |
+|---|---|
+| Input record | `{"id", "comment_text", "toxic"}` - the label field never enters state (leakage) |
+| `build_state(row)` | `{"content": sanitized_text, "char_len": int, "truncated": bool}` - sanitize first (adversarial strip, Section 5), then prune |
+| Budget (hermetic) | estimate = `len(text.split()) * 1.3` computed ONCE on the sanitized text before pruning: `est > 320` -> warn; `est > 300` -> head-truncate to 300 and set `truncated` (both checks read the same pre-truncation estimate; exact tokenizer count only in `@pytest.mark.live`) |
+| Precompute scope | Jigsaw rows carry **no dates / amounts / author history** - precompute reduces to length stats; do **not** fabricate metadata to fill the template |
 
 ---
 
@@ -419,6 +429,8 @@ else → escalate / hold
 
 Noul cookbook band: **0.30-0.70 = uncertain -> human review.** Choice: top-prob **< 0.60 = uncertain.** Bands are surfaced in the verdict object.
 
+**Transfer caveat (candidates, not locks):** these numbers come from Jev's cookbooks and Laya's confidence formula differs (Gotcha 15). Ship them as starting candidates only. The released band comes from our own **risk-coverage curve** (M7-core): sweep the gate threshold on the lock split, plot coverage vs error-on-act, pick the operating point that meets the error budget, then lock.
+
 ### 6c. Speculative fan-out (within a juror)
 
 One request per juror may include speculative questions (severity only matters if category=bug). Questions are evaluated in parallel; irrelevant answers are ignored in code.
@@ -446,7 +458,7 @@ Classic **ensemble / jury theory** applied to blind System One jurors.
 | H0 supported within delta | Panel does NOT reach +delta; CI upper bound < delta (panel cannot matter by declared margin) | **Leads abstract** if this is the result |
 | Inconclusive | Neither: CI spans 0 to >= delta, or power insufficient | **Must say inconclusive** — does not count as H0 support |
 
-**Declare before any labeled run:** primary metric (e.g. balanced accuracy or Youden's J on the inference set), **minimum detectable effect delta** (e.g. +8pp), and **required n for 80% power** at assumed discordance. Report achieved power/MDE in README even if <80%. n=50 stress fixtures alone: ~5% power for +4pp, ~17% for +8pp at 15% discordance — **insufficient for hypothesis testing**; they are descriptive only.
+**Declare before any labeled run:** primary metric (e.g. balanced accuracy or Youden's J on the inference set), **minimum detectable effect delta** (e.g. +8pp), and **required n for 80% power** at assumed discordance. Report achieved power/MDE in README even if <80%. n=50 stress fixtures alone: ~5% power for +4pp, ~17% for +8pp at 15% discordance — **insufficient for hypothesis testing**; they are descriptive only. Paired panel-vs-single on the same fixtures = **McNemar** on the discordant cells; with discordant rates p01/p10: `n ~ (z_(1-a/2)*sqrt(p01+p10) + z_(1-b)*sqrt(p01+p10-(p01-p10)^2))^2 / (p01-p10)^2`; test via `statsmodels.stats.contingency_tables.mcnemar`. Declare assumed p01/p10 when quoting required n. Power is driven by **discordant pairs only**: at >85% baseline agreement, n=200 with 15% discordance yields only ~30 informative pairs - quote n_disc alongside n.
 
 **H₁:** framings + calibrated weighting improve the primary metric by >= delta vs single-call baseline (matched conditions).
 **H₀:** shared weights + framing insufficiency => gain < delta (panel cannot help by a meaningful margin).
@@ -458,7 +470,7 @@ Framings differ by construction (separate calls, different wording), which targe
 
 **Caveat:** all jurors share the same model weights, so errors caused by *model-level* jaggedness (math, dates, sarcasm) are **correlated**. Ensembles reduce framing variance, not shared blind spots. Mitigation: precompute facts into state (Section 5).
 
-**External vs own numbers (policy):** quorum-cal's ~0.12 / ~0.65 figures are **motivation from a different setup** — cite in background only, never in this project's results tables, never as an expected value for our pipeline. If we report inter-juror error correlation (φ / κ / pairwise), we re-derive it on our fixtures with a **bootstrap 95% CI**; with N jurors and limited fixtures the interval may be wide — report the interval, not a bare point estimate. **README acceptance:** if the CI spans a range that changes the qualitative story (e.g. includes both near-0 and high correlation), say so in plain text ("data insufficient to pin rho") instead of quoting the point estimate.
+**External vs own numbers (policy):** quorum-cal's ~0.12 / ~0.65 figures are **motivation from a different setup** — cite in background only, never in this project's results tables, never as an expected value for our pipeline. If we report inter-juror error correlation (φ / κ / pairwise), we re-derive it on our fixtures with a **bootstrap 95% CI**; with N jurors and limited fixtures the interval may be wide — report the interval, not a bare point estimate. **README acceptance:** if the CI spans a range that changes the qualitative story (e.g. includes both near-0 and high correlation), say so in plain text ("data insufficient to pin rho") instead of quoting the point estimate. **rho definition (own numbers):** Pearson correlation of **error indicators** (e = 1[fixture wrong]) across jurors - not correlation of raw probabilities (a separate, weaker statistic).
 
 ### Ensemble math (formulas used in code)
 
@@ -491,6 +503,8 @@ Do **not** mix top-prob (Choice) with abs(p-0.5)*2 (Noul) — incompatible scale
 
 Optional normalize: `w_i / sum_j w_j` so weights sum to 1 (useful for reporting).
 
+**Why probability weights (rationale):** equal votes assume equal juror reliability; emitting probabilities lets a decisive juror outweigh a hesitant one. Pooling in probability space (above) is the pre-registered primary. **Log-odds pooling** (sum log-odds = product of odds) is the classic Bayesian-style combination for independent evidence - recorded here as *exploratory secondary only*; adopting it would need its own pre-registration before use.
+
 **Veto.** Given veto questions V with thresholds t_v:
 
     fired = any( juror_i answer for q in V has p_q >= t_v )
@@ -505,13 +519,13 @@ Optional normalize: `w_i / sum_j w_j` so weights sum to 1 (useful for reporting)
     N_eff(rho) = 1 / ( rho + (1-rho) * sum_i alpha_i^2 )
     # equal weights: N_eff = N / (1 + (N-1)*rho)   [matches Wavering Oracles form]
 
-Reporting rule: always report N_eff with an explicit rho assumption. Using 1/sum(alpha^2) alone silently assumes rho=0 — the case our own H0 denies. With N=3 and unknown rho, quote the formula and a rho sensitivity range, not a single point N_eff.
+Reporting rule: always report N_eff with an explicit rho assumption. Using 1/sum(alpha^2) alone silently assumes rho=0 — the case our own H0 denies. With N=3 and unknown rho, quote the formula and a rho sensitivity range, not a single point N_eff. Caveat: the equicorrelation form derives for **continuous** scores - applied to discrete plurality votes treat it as a heuristic and prefer the sensitivity range over any point N_eff.
 
 **Variance intuition (why panels help).** For a scalar score s_i with Var(s_i)=sigma^2 and pairwise corr rho:
 
     Var(mean) = sigma^2 * ( rho + (1-rho)/N )
     -> as N grows, only the (1-rho)/N term shrinks; rho is the floor.
-Same weights => rho > 0 from shared jaggedness (Section caveat). Framing diversity targets the (1-rho) component only.
+Same weights => rho > 0 from shared jaggedness (Section 7 Caveat). Framing diversity targets the (1-rho) component only.
 
 **Ablation metrics (M7 definitions):**
 
@@ -565,7 +579,7 @@ Evaluate top-down; first matching row wins.
 | 2 | Any cross-primitive conflict (Noul vs Choice within a juror) | `human_review` | Structural disagreement |
 | 3 | Juror label spread has no strict majority — at N=3 this is **only the 1-1-1 case** (a 2-1 split IS a strict majority); at N>3 any label with votes < ceil(N/2)+... see note | `human_review` | Fragmentation; **threshold locked only after escalation-rate simulation (M5/M7)** |
 | 4 | Aggregate confidence below floor (mean top-prob < 0.60, or mean Noul in 0.30-0.70) | `human_review` | Uncertainty band |
-| 5 | High **mean pairwise abs delta-p** on shared-criterion Nouns across jurors (not sample SD: N=3 => 2 df; wording confounds) | `human_review` | Deterministic-Laya dispersion; **auxiliary pre-reg: AUROC of this stat for error vs single-call confidence baseline** — report even if ~0.5 |
+| 5 | High **mean pairwise abs delta-p** on shared-criterion Nouns across jurors (not sample SD: N=3 => 2 df; wording confounds; trigger candidate |mean pairwise delta-p| >= 0.25) | `human_review` | Deterministic-Laya dispersion; **auxiliary pre-reg: AUROC of this stat for error vs single-call confidence baseline** — report even if ~0.5 |
 | 6 | Strict majority AND aggregate confidence above floor AND no conflicts | `auto_act` | |
 | 7 | (fallback) | `escalate` | Unreachable if rows 1-6 exhaustive; defensive default |
 
@@ -577,7 +591,7 @@ Evaluate top-down; first matching row wins.
 - Interview line: *dispersion = mean pairwise |delta-p| across framings on shared-criterion Nouns (auxiliary error-detection AUROC pre-registered); identical reruns are ~0 on CPU (exactly 0) and ~1e-4 on GPU — not a self-consistency mechanism.*
 - Follow-up ready: "does it predict error?" → answered by the pre-registered AUROC, not by asserting SD works.
 
-**Threshold discipline:** the table encodes *candidate* rules with default numbers (veto 0.70, band 0.30-0.70, top-prob 0.60). Before locking defaults, simulate the full table on labeled fixtures and record **escalation rate** (fraction of fixtures ending `human_review`/`escalate`) alongside accuracy-on-auto-act. If escalation rate is pathologically high (automation goal defeated) or accuracy-on-auto-act is not better than always-act, retune — do not ship a priori thresholds untouched. Escalation rate is a first-class M7 metric.
+**Threshold discipline:** the table encodes *candidate* rules with default numbers (veto 0.70, band 0.30-0.70, top-prob 0.60, row-5 dispersion 0.25). Before locking defaults, simulate the full table on labeled fixtures and record **escalation rate** (fraction of fixtures ending `human_review`/`escalate`) alongside accuracy-on-auto-act. If escalation rate is pathologically high (automation goal defeated) or accuracy-on-auto-act is not better than always-act, retune — do not ship a priori thresholds untouched. Escalation rate is a first-class M7 metric.
 
 ### Label normalization (required for vote/weight)
 
@@ -587,6 +601,7 @@ Jurors must share one **panel label vocabulary** or votes cannot be tallied.
 - Each juror's Choice question uses the **same keys**; only `instructions`/criteria *descriptions* differ per framing.
 - Normalization step: `juror_label = answers[qid]["choice"]` mapped through `LABELS`; unknown label -> flag + treat as abstain for that juror.
 - Noul-based jurors (binary framings) map `p >= 0.5` -> positive label, else negative label, into the same two-element vocabulary when the panel is binary.
+- **Polarity (D1 rule):** every primary gate is phrased toxicity-positive ("the comment attacks..."), so `p >= 0.5 -> toxic`. Record phrase polarity per juror (an inverted gate flips the mapping). Row-2 cross-primitive conflict = that normalized gate label != the juror's own Choice vote label.
 
 Without shared keys, plurality voting is undefined.
 
@@ -653,6 +668,9 @@ from dataclasses import dataclass, field
 class Juror:
     name: str
     questions: dict          # unique framing — different instructions/criteria
+    vote_key: str                     # the juror's primary vote question (e.g. "a_vote")
+    gate_key: str | None = None       # primary noul gate (e.g. "a_hate_gate"); None if no gate
+    gate_polarity_positive: bool = True  # True if gate statement is toxicity-positive (Section 7 polarity)
     # optional: repeats: int = 1
 
 @dataclass
@@ -672,7 +690,7 @@ class Verdict:
     dissent: list[str]
     juror_results: list[JurorResult]
 
-def run_panel(state, jurors: list[Juror], agent, strategy: str = "weight") -> Verdict:
+def run_panel(state, jurors: list[Juror], backend: DecisionBackend, strategy: str = "weight", concurrency: str = "sequential") -> Verdict:
     # 1. Run N separate predict() calls — jurors are blind to each other
     #    Laya predict() is SYNC and CPU/GPU-bound; see concurrency note below
     # 2. Normalize each juror's answer -> label + weight
@@ -715,92 +733,101 @@ No default latency win is claimed before the full tier passes. Epsilon 0.01 is a
 
 ---
 
-### Worked example (generic — concrete labels finalize with D1)
+### Worked example (Jigsaw Toxic - D1 locked; numbers illustrative)
 
 Illustrates one full pass: shared state -> 3 blind juror framings -> normalize -> aggregate -> status.
 
-**Shared state** (built once by `build_state`):
+**Shared state** (built once by `build_state`; D1 contract in Section 4):
 
 ```python
 state = {
-    "content": "Send me your credit card number and I will fix the billing myself.",
-    "author_trust_score": 0.2,          # precomputed in code; model does not do arithmetic
-    "prior_flags": 1,                   # precomputed count
-    "age_hours": 30,                    # precomputed date delta
+    "content": "You are a worthless idiot. Nobody wants you here, go kill yourself.",  # sanitized raw comment_text
+    "char_len": 66,        # precomputed in code; model does not count characters
+    "truncated": False,    # set by prune step if over budget (Section 4)
 }
-LABELS = ["allow", "flag", "remove"]    # shared panel vocabulary
+LABELS = ["clean", "toxic"]   # shared panel vocabulary (matches spike framing choice_v1)
 ```
 
-**Juror framings** (separate `predict` calls; disjoint question keys; same LABELS):
+**Juror framings** (separate `predict` calls; **juror-prefixed keys** so batched merge cannot collide; same LABELS):
 
 ```python
-juror_a = {  # safety-first framing
-    "safety_gate": {"type": "noul", "instructions": "Content requests payment credentials unsolicited"},
-    "action": {"type": "choice", "instructions": "Moderation action", "criteria": {
-        "allow": "No policy concern",
-        "flag": "Ambiguous; needs human look",
-        "remove": "Clear policy violation",
+juror_a = {  # direct-violation framing
+    "a_hate_gate": {"type": "noul", "instructions": "The comment attacks or insults a person or group"},
+    "a_vote": {"type": "choice", "instructions": "Classify this comment", "criteria": {
+        "clean": "civil, respectful, non-toxic",
+        "toxic": "rude, insulting, threatening, hateful",
     }},
 }
 
-juror_b = {  # intent framing
-    "pii_present": {"type": "noul", "instructions": "Personal financial data is solicited"},
-    "action": {"type": "choice", "instructions": "Moderation action", "criteria": {
-        "allow": "No policy concern",
-        "flag": "Ambiguous; needs human look",
-        "remove": "Clear policy violation",
+juror_b = {  # reader-impact framing
+    "b_harm_gate": {"type": "noul", "instructions": "Reading this would make a reasonable reader feel harassed or threatened"},
+    "b_vote": {"type": "choice", "instructions": "Classify this comment", "criteria": {
+        "clean": "civil, respectful, non-toxic",
+        "toxic": "rude, insulting, threatening, hateful",
     }},
 }
 
-juror_c = {  # harm-severity framing
-    "credibility": {"type": "noul", "instructions": "Author is attempting social engineering"},
-    "severity": {"type": "score", "instructions": "Potential harm if left up", "criteria": [
-        "None", "Minor", "Serious",
+juror_c = {  # forum-policy framing
+    "c_policy_gate": {"type": "noul", "instructions": "The comment violates a basic civility rule of discussion forums"},
+    "c_severity": {"type": "score", "instructions": "How severe if left visible", "criteria": [
+        "None", "Mild", "Severe",
     ]},
-    "action": {"type": "choice", "instructions": "Moderation action", "criteria": {
-        "allow": "No policy concern",
-        "flag": "Ambiguous; needs human look",
-        "remove": "Clear policy violation",
+    "c_vote": {"type": "choice", "instructions": "Classify this comment", "criteria": {
+        "clean": "civil, respectful, non-toxic",
+        "toxic": "rude, insulting, threatening, hateful",
     }},
 }
+```
+
+```python
+# build the Juror objects (dataclass above) from the framed question dicts:
+jurors = [
+    Juror(name="A", questions=juror_a, vote_key="a_vote", gate_key="a_hate_gate"),
+    Juror(name="B", questions=juror_b, vote_key="b_vote", gate_key="b_harm_gate"),
+    Juror(name="C", questions=juror_c, vote_key="c_vote", gate_key="c_policy_gate"),
+]
+# gate_polarity_positive defaults True (gates phrased toxicity-positive; Section 7)
 ```
 
 **Hypothetical answers:**
 
 | Juror | Key answers | Normalized label | Weight (illustrative) |
 |---|---|---|---|
-| A | `safety_gate.noul=0.93`, `action=remove` (top-prob 0.88) | `remove` | 0.88 |
-| B | `pii_present.noul=0.81`, `action=remove` (top-prob 0.74) | `remove` | 0.74 |
-| C | `credibility.noul=0.62`, `severity=2.4`, `action=flag` (top-prob 0.55) | `flag` | 0.55 |
+| A | `a_hate_gate.noul=0.93`, `a_vote=toxic` (top-prob 0.88) | `toxic` | 0.88 |
+| B | `b_harm_gate.noul=0.81`, `b_vote=toxic` (top-prob 0.74) | `toxic` | 0.74 |
+| C | `c_policy_gate.noul=0.62`, `c_severity=2.4`, `c_vote=clean` (top-prob 0.55) | `clean` | 0.55 |
 
-**Aggregation (weight strategy):** weighted sums -> `remove` leads; spread 2-1 (not a bare tie).
+**Aggregation (weight strategy):** weighted sums -> `toxic` leads 1.62 vs 0.55; spread 2-1 (not a bare tie).
+
+**Polarity mapping (Section 7):** each juror's primary gate statement is phrased toxicity-positive, so `gate p >= 0.5 -> normalized "toxic"`, else `"clean"`; row-2 conflict fires when a juror's normalized gate label differs from its own `*_vote` label.
 
 **Detector evaluation (Section 7 table):**
-- Row 1 (veto): if `safety_gate` is configured as a veto with threshold 0.70 -> A fires (0.93) -> **`escalate`** regardless of majority.
-- If veto not configured: row 3 no (strict majority remove), row 4: mean top-prob = (0.88+0.74+0.55)/3 = 0.723 >= 0.60; C's Noul 0.62 sits in 0.30-0.70 band only if that Noul is the aggregate signal — define aggregate Noul as mean of juror primary Nouns (0.93+0.81+0.62)/3 = 0.787 > 0.70. No row 2 conflict. -> **`auto_act`** with label `remove`, dissent records C's minority `flag`.
+- Row 1 (veto): if `a_hate_gate` is configured as a veto with threshold 0.70 -> A fires (0.93) -> **`escalate`** regardless of majority.
+- If veto not configured: **row 2 fires** - C's `c_policy_gate` normalizes to `toxic` (0.62 >= 0.5) but C voted `clean` -> cross-primitive conflict -> **`human_review`**.
+- Had C's gate read 0.81 (aligned): row 2 clear; row 3 no (2-1 strict majority `toxic`); row 4: mean top-prob = (0.88+0.74+0.55)/3 = 0.723 >= 0.60 and mean primary gates = (0.93+0.81+0.81)/3 = 0.85 > 0.70 -> row 6 **`auto_act`** with label `toxic`, dissent records C's minority `clean`.
 
-**Verdict object (shape):**
+**Verdict object (shape, veto path):**
 
 ```python
 Verdict(
     status="escalate",            # veto row won
-    winning_label="remove",       # still recorded from tally
-    tally={"remove": 2, "flag": 1},
-    weighted={"remove": 1.62, "flag": 0.55},
-    dissent=["veto:safety_gate>=0.70 (juror A)", "minority: C=flag"],
+    winning_label="toxic",        # still recorded from tally
+    tally={"toxic": 2, "clean": 1},
+    weighted={"toxic": 1.62, "clean": 0.55},
+    dissent=["veto:a_hate_gate>=0.70 (juror A)", "minority: C=clean"],
     juror_results=[...],
 )
 ```
 
-Replace `LABELS` and question text when D1 is chosen; mechanics stay identical.
+Key names are juror-prefixed (`a_*` / `b_*` / `c_*`) so the optional batched-merge mode (`{**ja, **jb, **jc}`) cannot collide - M3 requires disjoint question namespaces either way; the sequential default is unaffected.
 
 ---
 
-## 10. Design decisions still open (decide before build)
+## 10. Design decisions (D1 + D2 decided; D3-D7 open - decide before build)
 
 | # | Decision | Options | Notes |
 |---|---|---|---|
-| D1 | Domain for the demo judge | PR review · content moderation · hiring screen · incident triage · bug ticket severity | Pick one with (a) natural yes/no gates, (b) a small label set, (c) an obvious veto (safety/PII) |
+| D1 | ~~Domain~~ **DECIDED** | **Content moderation - Jigsaw Toxic Comment** | Locked by competence spike 2026-09-29 (seed 42, framing `choice_v1`, n=50 balanced): **acc 0.860** (43/50), toxic recall 0.840, clean recall 0.880, one-sided binomial p < 1e-7 vs 0.50, pre-registered gate 0.65. Data: HF mirror `Heliosoph/Jigsaw-Toxic-Comments` (byte-for-byte claim; competition acceptance rule never exercised). Labels `clean`/`toxic`. Caveat: wrong answers still carry mean top-prob 0.643 (> 0.60 cookbook floor) -> refit thresholds on our own splits (M7). Spike script lives OUTSIDE the repo - never commit |
 | D2 | ~~API path~~ **DECIDED** | **Laya local** (`laya.load`) — free, Apache 2.0 | Hosted Jev/OpenRouter only as optional future baseline (M8 ablation) |
 | D3 | Juror count & framings | 3 · 5 · configurable | Configurable, default 3 (fast demo, clear dissent math) |
 | D4 | Strategy surface | ship all 3 (vote/weight/veto) or pick one | All three implemented |
@@ -839,9 +866,10 @@ Replace `LABELS` and question text when D1 is chosen; mechanics stay identical.
 **Goal:** domain object -> sanitized, precomputed state dict.
 
 - [ ] `build_state(obj) -> dict` with only allowed keys
-- [ ] Precompute: absolute dates, counts, sums, boolean flags
+- [ ] Precompute: length/token stats + boolean flags (D1: Jigsaw rows carry no dates/amounts - Section 4 contract; date/sum precompute stays a generic capability, not a D1 task)
 - [ ] Strip/truncate: untrusted HTML, instruction-like substrings, oversize fields
-- [ ] Enforce rough token budget warning (>320 tokens English root)
+- [ ] D1 I/O contract: in `{"id", "comment_text", "toxic"}` -> state `{"content", "char_len", "truncated"}` - label stripped before state (leakage); no fabricated metadata (Jigsaw has no dates/author history)
+- [ ] Token budget, hermetic: estimate `len(text.split()) * 1.3` (same pre-truncation estimate feeds both checks): `>320` warn, `>300` head-truncate to 300 + set `truncated`; exact tokenizer count only in `@pytest.mark.live`
 - [ ] Unit tests: fixture snapshots in/out
 
 ### M2 — Backend wrapper
@@ -851,6 +879,7 @@ Replace `LABELS` and question text when D1 is chosen; mechanics stay identical.
 - [ ] `protocol DecisionBackend: predict(state, questions) -> dict`
 - [ ] `LayaBackend`: lazy `laya.load`, `USE_TF=0` documented, cache single agent
 - [ ] Result adapter: normalize to `{qid: {type, value, prob/conf}}` internal shape
+- [ ] **Verify `answer_confidence` on Noul answers** (first live call); if absent, adapter computes `max(p, 1-p)` (Sections 2b/3)
 - [ ] Smoke: live predict marked `@pytest.mark.live`
 - [ ] Record machine latency (sequential, 1 call) for README baseline
 - [ ] **Noise floor:** run identical state+questions >=5 times sequentially; record max abs probability delta (expected ~0 on CPU; nonzero only if GPU nondeterminism). Feed into final leakage ε = max(0.01, 2 x floor)
@@ -859,8 +888,8 @@ Replace `LABELS` and question text when D1 is chosen; mechanics stay identical.
 
 **Goal:** N framings -> list[JurorResult] via configured concurrency model.
 
-- [ ] `Juror` dataclass: name, questions dict, optional veto flags
-- [ ] Domain framings module (3 juror dicts) — content depends on D1
+- [ ] `Juror` dataclass: name, questions, vote_key, gate_key, gate_polarity_positive (Section 9)
+- [ ] Domain framings module (3 juror dicts) - Jigsaw Toxic (D1 locked; concrete framings in Section 9)
 - [ ] `run_panel(state, jurors, backend, concurrency)` implementing sequential + batched modes
 - [ ] Assert identical `state` object passed to every juror
 - [ ] Assert disjoint question key namespaces (or documented merge/split)
@@ -874,7 +903,7 @@ Replace `LABELS` and question text when D1 is chosen; mechanics stay identical.
 - [ ] `aggregate_vote(labels) -> (winner, tally, tie: bool)`
 - [ ] `aggregate_weight(labels, weights) -> (winner, weighted_sum)`
 - [ ] `check_veto(answers, veto_specs) -> fired[]`
-- [ ] Detectors: cross-primitive conflict, label spread, low confidence, high SD
+- [ ] Detectors: cross-primitive conflict, label spread, low confidence, high mean pairwise |delta-p| (dispersion - NOT sample SD)
 - [ ] Table-driven tests including ties and empty inputs
 - [ ] Property: permutation invariance
 
@@ -907,7 +936,7 @@ Replace `LABELS` and question text when D1 is chosen; mechanics stay identical.
 **M7-core (required):**
 - [ ] Competence check: single-call >= majority-class on inference test (else report "not competent", stop H1/H0)
 - [ ] Temperature fit on **fit split only**; ECE + Brier + NLL before/after on **held-out**
-- [ ] Threshold lock on **lock split** via simulation; Clopper-Pearson bounds on error rate among auto-acts (0 errors in 30 auto-acts => 95% upper bound 9.5%; 1 error => 14.4%); rows without support stay `provisional`
+- [ ] Threshold lock on **lock split** via simulation; Clopper-Pearson bounds on error rate among auto-acts (0 errors in 30 auto-acts => **one-sided** 95% exact upper bound 9.5% - two-sided 95% is 11.6%, so state which; 1 error => 14.9% one-sided - recompute exactly with `scipy.stats.beta.ppf` when quoting); rows without support stay `provisional`
 - [ ] Escalation rate + accuracy-on-auto-act on held-out
 - [ ] **Primary comparison at matched coverage:** risk-coverage curve; panel vs **single-call gated to the same coverage** (confidence threshold tuned on lock split) — not panel-selective vs always-act full coverage
 - [ ] Panel vs single (primary framing) on held-out: agreement, flip, **McNemar**, **bootstrap 95% CIs** on primary metric diff
@@ -991,7 +1020,7 @@ Note: exact torch/transformers pins resolved at M0 install time on the target ma
 ### CLI interface (M5)
 
 ```text
-judge --state path/to/state.json       [--strategy vote|weight|veto]       [--labels allow,flag,remove]       [--concurrency sequential|batched]       [--repeats K]       [--format json|text]       [--output verdict.json]
+judge --state path/to/state.json       [--strategy vote|weight|veto]       [--labels clean,toxic]       [--concurrency sequential|batched]       [--repeats K]       [--format json|text]       [--output verdict.json]
 ```
 
 | Flag | Default | Purpose |
@@ -1013,7 +1042,7 @@ Exit codes: `0` auto_act, `2` human_review, `3` escalate, `1` error — enables 
 | `aggregators.py` | vote/weight/veto pure functions | no | table-driven cases: ties, unanimous, empty |
 | `detectors.py` | each detector fires / does not fire | no | given fabricated JurorResults |
 | `verdict` status | every row of Section 7 table | no | one test per row + precedence pairs |
-| `state_builder` | sanitizers strip/rewrite; precomputed dates | no | fixture in/out snapshots |
+| `state_builder` | sanitizers strip/rewrite; precomputed length stats | no | fixture in/out snapshots |
 | `panel` wiring | jurors receive identical state, disjoint keys | mock backend | fake `DecisionBackend` returns canned answers |
 | `calibration` | temperature fit reduces ECE on synthetic | no | small labeled fixture set |
 | `live` | one real Laya forward pass smoke test | yes | `@pytest.mark.live`; excluded from default CI |
@@ -1129,4 +1158,4 @@ Also observed (GitHub, details unverified): `zengzifan1/multi-agent-moderation` 
 
 ---
 
-*Open decisions: D1 (domain), D3-D7 (see Section 10). Backend: Laya (Section 2b).*
+*Decisions: D1 = content moderation (Jigsaw Toxic, Section 10), D2 = Laya local (Section 2b). Open: D3-D7 (Section 10).*
