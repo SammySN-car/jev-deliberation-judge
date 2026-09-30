@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install package + dev tools
+        run: python -m pip install -e ".[dev]"
+      - name: Lint (ruff)
+        run: python -m ruff check .
+      - name: Tests (hermetic only; no model load)
+        run: python -m pytest -m "not live" -v
