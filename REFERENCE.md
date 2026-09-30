@@ -1,4 +1,4 @@
-﻿# Multi-Agent Deliberation Judge — Planning & Design Reference (Laya backend)
+# Multi-Agent Deliberation Judge — Planning & Design Reference (Laya backend)
 
 > **Purpose:** Pre-build technical reference covering System One decision models, calibration, ensemble aggregation, and local model serving. Material drawn from official TypeSafe docs and Laya/Hugging Face sources.
 >

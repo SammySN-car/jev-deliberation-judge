@@ -1,4 +1,4 @@
-﻿[project]
+[project]
 name = "deliberation-judge"
 version = "0.1.0"
 description = "Blind multi-juror deliberation over local calibrated decision models (Laya) with abstention and held-out evaluation"

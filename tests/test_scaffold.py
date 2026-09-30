@@ -1,4 +1,4 @@
-﻿"""Scaffold smoke tests — no model load."""
+"""Scaffold smoke tests — no model load."""
 
 from deliberation_judge import __version__
 

@@ -1,4 +1,4 @@
-﻿"""CLI entrypoint (implemented in M5)."""
+"""CLI entrypoint (implemented in M5)."""
 
 
 def main() -> None:

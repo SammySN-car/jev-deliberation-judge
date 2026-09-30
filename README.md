@@ -1,4 +1,4 @@
-﻿# deliberation-judge
+# deliberation-judge
 
 Multi-agent deliberation judge: multiple blind framings of one state, evaluated by a local calibrated decision model (Laya), aggregated in code (vote / weight / veto) with explicit abstention.
 
