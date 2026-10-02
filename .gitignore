@@ -29,3 +29,6 @@ Thumbs.db
 # Model caches (local weights)
 .cache/
 *.safetensors
+
+# Data: inference set downloaded in M6, never commit
+data/
